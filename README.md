@@ -26,6 +26,6 @@
 
 
 <p align="center">
-  <img src="png/wechat.jpg" width="200px" height="200px" alt="Banner" />
+  <img src="http://mmbiz.qpic.cn/mmbiz_jpg/51JR1l00qustYVCdJtwPbfGs7b2hq9ic0bGiasmWrXib9DpCzpPKMCLwv54A9928y9HibbeEdUjsyusWvjmRc9jPgA/0" width="200px" height="200px" alt="Banner" />
 </p>
 
