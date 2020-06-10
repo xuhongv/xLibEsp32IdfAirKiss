@@ -1,11 +1,3 @@
-/*
- * @Description: esp32 idf master分支实现 微信配网以及近场发送自定义消息到微信公众号
- * @Author: xuhong https://github.com/xuhongv 【i love china】
- * @Date: 2019-10-02 15:57:42
- * @LastEditTime: 2019-10-05 21:45:01
- * @LastEditors: Please set LastEditors
- */
-
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -17,138 +9,134 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
-#include "tcpip_adapter.h"
+#include "esp_netif.h"
 #include "esp_smartconfig.h"
-
+#include "airkiss.h"
+#include "mbedtls/base64.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 
-#include "xAirkiss.h"
-
-
 /**
- *    由于 esp-idf esp32芯片 sdk 乐鑫没开源微信近场发现的功能，于是动动手指做起来！
+ *    由于 esp-idf esp32/esp32 s2芯片 sdk 乐鑫没开源微信近场发现的功能，于是动动手指做起来！
  *    这是微信airkiss配网以及近场发现的功能的demo示范，亲测可以配网成功以及近场发现！
  *    有任何技术问题邮箱： 870189248@qq.com 
  *    本人GitHub仓库：https://github.com/xuhongv
  *    本人博客：https://blog.csdn.net/xh870189248
  **/
 
-
-static const char *TAG = "esp32-idf-airkiss-example";
-
-#define CONFIG_AIRKISS_APPID "gh_ee12f1dffa4e"               //微信公众号的原始ID
-#define CONFIG_AIRKISS_DEVICEID "https://github.com/xuhongv" //设备id 也就是自定义消息
-#define CONFIG_DUER_AIRKISS_KEY ""                           //默认是空即可
-
+ 
 static EventGroupHandle_t s_wifi_event_group;
-static const int WIFI_CONNECTED_BIT = BIT0;
-static const int AIRKISS_DONE_BIT = BIT1;
+static const int CONNECTED_BIT = BIT0;
+static const int CONFIG_NET_DONE_BIT = BIT1;
+static const char *TAG = "airkiss_s2";
 
-static void TaskAirKiss(void *parm);
+static void smartconfig_example_task(void *parm);
 
-static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+const airkiss_config_t ak_config = {
+    (airkiss_memset_fn)&memset,
+    (airkiss_memcpy_fn)&memcpy,
+    (airkiss_memcmp_fn)&memcmp,
+    (airkiss_printf_fn)&printf,
+};
+
+//airkiss
+#define COUNTS_BOACAST 30            //发包次数，微信建议20次以上
+#define ACCOUNT_ID "gh_4248324a4d02" //微信公众号
+#define LOCAL_UDP_PORT 12476         //固定端口号
+int sock_fd;
+
+//近场发现自定义消息
+uint8_t deviceInfo[100] = {"{\"name\":\"xuhong\",\"age\":18}"};
+
+
+static void TaskCreatSocket(void *pvParameters)
 {
 
-    ESP_LOGI(TAG, "esp_event_base_t :%s , event_id: %d ", event_base, event_id);
+    char rx_buffer[128];
+    uint8_t tx_buffer[512];
+    uint8_t lan_buf[300];
+    uint16_t lan_buf_len;
+    struct sockaddr_in server_addr;
+    int sock_server; /* server socked */
+    int err;
+    int counts = 0;
+    size_t len;
 
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    //base64加密要发送的数据
+    if (mbedtls_base64_encode(tx_buffer, strlen((char *)tx_buffer), &len, deviceInfo, strlen((char *)deviceInfo)) != 0)
     {
-        xTaskCreate(TaskAirKiss, "TaskAirKiss", 4096, NULL, 3, NULL);
+        printf("[xuhong] fail mbedtls_base64_encode %s\n", tx_buffer);
+        vTaskDelete(NULL);
     }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+
+    sock_server = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_server == -1)
     {
-        esp_wifi_connect();
-        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        printf("failed to create sock_fd!\n");
+        vTaskDelete(NULL);
     }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY); // inet_addr("255.255.255.255");
+    server_addr.sin_port = htons(LOCAL_UDP_PORT);
+
+    err = bind(sock_server, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (err == -1)
     {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        //打印下路由器分配的ip
-        ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->ip_info.ip));
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        vTaskDelete(NULL);
     }
-}
 
-/**
- * @description: 初始化wifi事件监听
- * @param {type} 
- * @return: 
- */
-void initialise_wifi()
-{
-    s_wifi_event_group = xEventGroupCreate();
-    tcpip_adapter_init();
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-}
-
-/**
- * @description:  微信配网已经近场发现的事件监听
- * @param {type} 
- * @return: 
- */
-void TaskAirKissListener(void *p)
-{
-    xAirKissMsg sMsg;
+    struct sockaddr_in sourceAddr;
+    socklen_t socklen = sizeof(sourceAddr);
     while (1)
     {
-        if (xAirKissReceiveMsg(&sMsg))
+        memset(rx_buffer, 0, sizeof(rx_buffer));
+        int len = recvfrom(sock_server, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&sourceAddr, &socklen);
+
+        ESP_LOGI(TAG, "IP:%s:%d", (char *)inet_ntoa(sourceAddr.sin_addr), htons(sourceAddr.sin_port));
+        //ESP_LOGI(TAG, "Received %s ", rx_buffer);
+
+        // Error occured during receiving
+        if (len < 0)
         {
-            ESP_LOGI(TAG, "xAirKissReceiveMsg %d", sMsg.type);
-            switch (sMsg.type)
-            {
-            case xAirKiss_MSG_TYPE_SATRT: // 开始配网 嗅探
-                ESP_LOGI(TAG, "xAirKissReceiveMsg xAirKiss_MSG_TYPE_SATRT");
-                break;
-            case xAirKiss_MSG_TYPE_CHANNLE_LOCKED: // 已经监听到了airkiss的数据，锁定了信道
-                break;
-            case xAirKiss_MSG_TYPE_GET_SSID_PASSWORD: // 成功获取路由器名字和密码
-                ESP_LOGI(TAG, " get ssid[len:%d]: %s", sMsg.ssidLen, (char *)sMsg.ssid);
-                ESP_LOGI(TAG, " get password[len:%d]: %s", sMsg.passwordLen, (char *)sMsg.password);
-                //连接路由器
-                wifi_config_t wifi_config;
-                bzero(&wifi_config, sizeof(wifi_config_t));
-                memcpy(wifi_config.sta.ssid, sMsg.ssid, sMsg.ssidLen);
-                memcpy(wifi_config.sta.password, sMsg.password, sMsg.passwordLen);
-                ESP_ERROR_CHECK(esp_wifi_disconnect());
-                ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-                ESP_ERROR_CHECK(esp_wifi_connect());
-                break;
-            case xAirKiss_MSG_TYPE_TIMEOUT: // 失败获取路由器名字和密码，超时
-                break;
-            case xAirKiss_MSG_TYPE_SEND_ACK_TO_WEICHAT_OVER: // 配网成功后，设备端发送配网成功的ack到微信端
-            {
-                //这里开始近场发现，注意的 CONFIG_AIRKISS_DEVICEID 务必是非json格式，个人建议是 base64 加密之后字符串
-                airkiss_lan_pack_param_t *air_info = calloc(1, sizeof(airkiss_lan_pack_param_t));
-                air_info->appid = CONFIG_AIRKISS_APPID;
-                air_info->deviceid = CONFIG_AIRKISS_DEVICEID;
-                airkiss_start_local_find(air_info);
-            }
+            ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
             break;
-            case xAirKiss_MSG_TYPE_LOCAL_FIND_START: //开始近场发现
-                ESP_LOGI(TAG, "xAirKissReceiveMsg xAirKiss_MSG_TYPE_LOCAL_FIND_START");
-                break;
-            case xAirKiss_MSG_TYPE_LOCAL_FIND_SENDING: //开始近场发现 发送消息中
-                ESP_LOGI(TAG, "xAirKissReceiveMsg xAirKiss_MSG_TYPE_LOCAL_FIND_SENDING");
-                break;
-            case xAirKiss_MSG_TYPE_LOCAL_FIND_STOP: //结束近场发现
-                ESP_LOGI(TAG, "xAirKissReceiveMsg xAirKiss_MSG_TYPE_LOCAL_FIND_STOP");
-                xEventGroupSetBits(s_wifi_event_group, AIRKISS_DONE_BIT);
-                //结束所有配网队列
-                airkiss_stop_all();
-                //删除本任务
-                vTaskDelete(NULL);
+        }
+        // Data received
+        else
+        {
+            rx_buffer[len] = 0;                                                   // Null-terminate whatever we received and treat like a string
+            airkiss_lan_ret_t ret = airkiss_lan_recv(rx_buffer, len, &ak_config); //检测是否为微信发的数据包
+            airkiss_lan_ret_t packret;
+            switch (ret)
+            {
+            case AIRKISS_LAN_SSDP_REQ:
+
+                lan_buf_len = sizeof(lan_buf);
+                //开始组装打包
+                packret = airkiss_lan_pack(AIRKISS_LAN_SSDP_NOTIFY_CMD, ACCOUNT_ID, tx_buffer, 0, 0, lan_buf, &lan_buf_len, &ak_config);
+                if (packret != AIRKISS_LAN_PAKE_READY)
+                {
+                    ESP_LOGE(TAG, "Pack lan packet error!");
+                    continue;
+                }
+                ESP_LOGI(TAG, "Pack lan packet ok !");
+                //发送至微信客户端
+                int err = sendto(sock_server, (char *)lan_buf, lan_buf_len, 0, (struct sockaddr *)&sourceAddr, sizeof(sourceAddr));
+                if (err < 0)
+                {
+                    ESP_LOGE(TAG, "Error occured during sending: errno %d", errno);
+                }
+                else if (counts++ > COUNTS_BOACAST)
+                {
+                    shutdown(sock_fd, 0);
+                    close(sock_fd);
+                    vTaskDelete(NULL);
+                }
                 break;
             default:
                 break;
@@ -156,39 +144,101 @@ void TaskAirKissListener(void *p)
         }
     }
 }
-/**
- * @description: 微信配网流程
- * @param {type} 
- * @return: 
- */
-static void TaskAirKiss(void *parm)
+
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 4096, NULL, 3, NULL);
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        esp_wifi_connect();
+        xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
+    }
+    else if (event_base == SC_EVENT && event_id == SC_EVENT_SCAN_DONE)
+    {
+        ESP_LOGI(TAG, "Scan done");
+    }
+    else if (event_base == SC_EVENT && event_id == SC_EVENT_FOUND_CHANNEL)
+    {
+        ESP_LOGI(TAG, "Found channel");
+    }
+    else if (event_base == SC_EVENT && event_id == SC_EVENT_GOT_SSID_PSWD)
+    {
+        ESP_LOGI(TAG, "Got SSID and password");
+
+        smartconfig_event_got_ssid_pswd_t *evt = (smartconfig_event_got_ssid_pswd_t *)event_data;
+        wifi_config_t wifi_config;
+        uint8_t ssid[33] = {0};
+        uint8_t password[65] = {0};
+
+        bzero(&wifi_config, sizeof(wifi_config_t));
+        memcpy(wifi_config.sta.ssid, evt->ssid, sizeof(wifi_config.sta.ssid));
+        memcpy(wifi_config.sta.password, evt->password, sizeof(wifi_config.sta.password));
+        wifi_config.sta.bssid_set = evt->bssid_set;
+        if (wifi_config.sta.bssid_set == true)
+        {
+            memcpy(wifi_config.sta.bssid, evt->bssid, sizeof(wifi_config.sta.bssid));
+        }
+
+        memcpy(ssid, evt->ssid, sizeof(evt->ssid));
+        memcpy(password, evt->password, sizeof(evt->password));
+        ESP_LOGI(TAG, "SSID:%s", ssid);
+        ESP_LOGI(TAG, "PASSWORD:%s", password);
+
+        ESP_ERROR_CHECK(esp_wifi_disconnect());
+        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    }
+    else if (event_base == SC_EVENT && event_id == SC_EVENT_SEND_ACK_DONE)
+    {
+        xEventGroupSetBits(s_wifi_event_group, CONFIG_NET_DONE_BIT);
+    }
+}
+
+static void initialise_wifi(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(SC_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static void smartconfig_example_task(void *parm)
 {
     EventBits_t uxBits;
-
-    //开始配网
-    airkiss_config_info_t air_info = AIRKISS_CONFIG_INFO_DEFAULT();
-    air_info.lan_pack.appid = CONFIG_AIRKISS_APPID;
-    air_info.lan_pack.deviceid = CONFIG_AIRKISS_DEVICEID;
-    air_info.aes_key = CONFIG_DUER_AIRKISS_KEY;
-    airkiss_start(&air_info);
-
-    ESP_LOGI(TAG, "xAirkiss_version: %s", xAirkiss_version());
-
-    xTaskCreate(TaskAirKissListener, "TaskAirKissListener", 1024 * 2, NULL, 8, NULL); // 创建任务
-
+    ESP_ERROR_CHECK(esp_smartconfig_set_type(SC_TYPE_AIRKISS));
+    smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_smartconfig_start(&cfg));
     while (1)
     {
-        uxBits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | AIRKISS_DONE_BIT, true, false, portMAX_DELAY);
-        if (uxBits & WIFI_CONNECTED_BIT)
+        uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT | CONFIG_NET_DONE_BIT, true, false, portMAX_DELAY);
+        if (uxBits & CONNECTED_BIT)
         {
             ESP_LOGI(TAG, "WiFi Connected to ap");
-            //通知微信公众号配网成功
-            airkiss_nofity_connect_ok();
         }
-        if (uxBits & AIRKISS_DONE_BIT)
+        if (uxBits & CONFIG_NET_DONE_BIT)
         {
-            ESP_LOGI(TAG, "airkiss over");
-
+            ESP_LOGI(TAG, "smartconfig over");
+            xTaskCreate(TaskCreatSocket, "TaskCreatSocket", 1024 * 4, NULL, 5, NULL);
+            esp_smartconfig_stop();
             vTaskDelete(NULL);
         }
     }
@@ -201,35 +251,6 @@ static void TaskAirKiss(void *parm)
  */
 void app_main(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-
-    printf("\n\n-------------------------------- Get Systrm Info Start ------------------------------------------\n");
-    //获取IDF版本
-    printf("     SDK version:%s\n", esp_get_idf_version());
-    //获取芯片可用内存
-    printf("     esp_get_free_heap_size : %d  \n", esp_get_free_heap_size());
-    //获取从未使用过的最小内存
-    printf("     esp_get_minimum_free_heap_size : %d  \n", esp_get_minimum_free_heap_size());
-    uint8_t mac[6];
-    //获取mac地址（station模式）
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    printf(" Station esp_read_mac(): %02x:%02x:%02x:%02x:%02x:%02x \n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    //获取mac地址（ap模式）
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-    printf(" AP esp_read_mac(): %02x:%02x:%02x:%02x:%02x:%02x \n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    //获取mac地址（蓝牙模式）
-    esp_read_mac(mac, ESP_MAC_BT);
-    printf(" BT esp_read_mac(): %02x:%02x:%02x:%02x:%02x:%02x \n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    //获取mac地址（以太网）
-    esp_read_mac(mac, ESP_MAC_ETH);
-    printf(" Eth esp_read_mac(): %02x:%02x:%02x:%02x:%02x:%02x \n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    printf("\n\n-------------------------------- Get Systrm Info End ------------------------------------------\n");
-
+    ESP_ERROR_CHECK(nvs_flash_init());
     initialise_wifi();
 }
